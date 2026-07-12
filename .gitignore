@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+state/sp500_state.json
+.DS_Store
