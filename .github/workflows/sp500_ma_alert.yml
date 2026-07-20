@@ -55,7 +55,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: state
-          key: sp500-state-v1
+          # 动态 key: 每次运行都不同, 保证跑完后能上传新版本
+          # restore-keys 前缀匹配: 取最近一次的 state 作为恢复起点
+          key: sp500-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             sp500-state-
 

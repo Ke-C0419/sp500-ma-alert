@@ -10,6 +10,7 @@ SPX (标普500) 150MA 突破监控告警
   - 周六心跳 (UTC 02:00): 固定推送一次, 确认服务存活 + 当前状态
 
 状态持久化: state/sp500_state.json (在 GitHub Actions 中用 actions/cache 持久化)
+连续天数: 从 K 线回溯计算, 不依赖状态文件, 即使 cache 丢失也能给出真实值
 
 用法:
   python scripts/sp500_ma_alert.py            # 自动判断模式 (UTC 周六=心跳, 其它=日常)
@@ -54,8 +55,8 @@ def push_serverchan(title: str, content: str) -> bool:
 
 
 # ─── 数据获取 ────────────────────────────────────────────────────────────
-def fetch_spx_close_and_ma():
-    """返回 (today_close, today_ma150, today_date_str, last_close)"""
+def fetch_spx_data():
+    """返回 (today_close, today_ma, today_date_str, last_close, close_series, ma_series)"""
     import yfinance as yf
     # period=1y 给足 150 个交易日; auto_adjust=False 取原始收盘价
     hist = yf.Ticker(SYMBOL).history(period="1y", auto_adjust=False)
@@ -71,7 +72,43 @@ def fetch_spx_close_and_ma():
     today_ma = float(ma150.iloc[-1])
     last_close = float(close.iloc[-2]) if len(close) >= 2 else None
     today_date_str = str(close.index[-1].date())  # 用交易日期, 比 UTC 更准
-    return today_close, today_ma, today_date_str, last_close
+    return today_close, today_ma, today_date_str, last_close, close, ma150
+
+
+def compute_run_stats(close, ma) -> tuple[int, str | None]:
+    """从 K 线回溯计算当前状态已持续多少个交易日, 以及本段持续期的起始日期
+
+    不依赖状态文件, 即使 cache 丢失也能给出真实值.
+
+    Returns:
+        (consecutive_days, run_start_date)
+        - consecutive_days: 当前状态 (above/below) 已连续保持的交易日数 (含今天)
+        - run_start_date: 本段持续期第一天 (即上次翻转当日), 'YYYY-MM-DD'
+                          若 K 线全程都是同一状态, 返回最早一个有 MA 的日期
+    """
+    import pandas as pd
+    n = len(close)
+    if n == 0:
+        return 1, None
+
+    today_state = "above" if close.iloc[-1] > ma.iloc[-1] else "below"
+
+    count = 0
+    run_start_date = None
+    for i in range(n - 1, -1, -1):
+        if pd.isna(ma.iloc[i]):
+            break
+        state_i = "above" if close.iloc[i] > ma.iloc[i] else "below"
+        if state_i == today_state:
+            count += 1
+            run_start_date = str(close.index[i].date())
+        else:
+            break
+
+    if count == 0:
+        count = 1
+        run_start_date = str(close.index[-1].date())
+    return count, run_start_date
 
 
 # ─── 状态文件 ────────────────────────────────────────────────────────────
@@ -92,10 +129,12 @@ def save_state(state: dict) -> None:
 
 
 # ─── 主流程 ──────────────────────────────────────────────────────────────
-def run_daily(today_close: float, today_ma: float, today_date_str: str, last_state: dict | None) -> dict:
+def run_daily(today_close: float, today_ma: float, today_date_str: str,
+              last_state: dict | None, consecutive_days: int, run_start_date: str | None) -> dict:
     """日常模式: 状态变化才推送"""
     today_state = "above" if today_close > today_ma else "below"
-    print(f"📊 今日({today_date_str}) SPX 收盘 {today_close:.2f}, 150MA {today_ma:.2f}, 状态={today_state}")
+    print(f"📊 今日({today_date_str}) SPX 收盘 {today_close:.2f}, 150MA {today_ma:.2f}, "
+          f"状态={today_state}, 持续 {consecutive_days} 个交易日 (自 {run_start_date} 起)")
 
     last_state_str = last_state.get("state") if last_state else None
     last_state_date = last_state.get("date") if last_state else None
@@ -103,15 +142,11 @@ def run_daily(today_close: float, today_ma: float, today_date_str: str, last_sta
     if last_state_str is None:
         # 首次运行 / 状态丢失: 不告警, 只初始化
         print("🆕 无历史状态, 视为初始化, 不告警")
-        # 计算已持续天数 (粗略): 从今天开始计 1
-        consecutive_days = 1
     elif last_state_str == today_state:
         # 状态未变, 不推送
-        consecutive_days = int(last_state.get("consecutive_days", 0)) + 1
-        print(f"✅ 状态未变 (上次 {last_state_date} = {last_state_str}), 持续 {consecutive_days} 个交易日, 不推送")
+        print(f"✅ 状态未变 (上次 {last_state_date} = {last_state_str}), 不推送")
     else:
         # 状态变化! 推送告警
-        consecutive_days = 1
         arrow = "站上 → 跌破" if last_state_str == "above" else "跌破 → 站上"
         title = f"⚠️ SPX 150MA 状态变化: {arrow}"
         content = (
@@ -120,6 +155,7 @@ def run_daily(today_close: float, today_ma: float, today_date_str: str, last_sta
             f"**今日收盘**: {today_close:.2f}\n\n"
             f"**150MA**: {today_ma:.2f}\n\n"
             f"**状态变化**: {arrow}\n\n"
+            f"**当前持续**: {consecutive_days} 个交易日 (自 {run_start_date} 起)\n\n"
             f"**上次状态日期**: {last_state_date}\n\n"
             f"---\n_GitHub Actions 自动告警_"
         )
@@ -132,17 +168,14 @@ def run_daily(today_close: float, today_ma: float, today_date_str: str, last_sta
         "close": today_close,
         "ma150": today_ma,
         "consecutive_days": consecutive_days,
+        "run_start_date": run_start_date,
     }
 
 
-def run_heartbeat(today_close: float, today_ma: float, today_date_str: str, last_state: dict | None) -> dict:
+def run_heartbeat(today_close: float, today_ma: float, today_date_str: str,
+                  last_state: dict | None, consecutive_days: int, run_start_date: str | None) -> dict:
     """心跳模式: 固定推送"""
     today_state = "above" if today_close > today_ma else "below"
-    consecutive_days = (
-        int(last_state.get("consecutive_days", 0)) + 1
-        if last_state and last_state.get("state") == today_state
-        else 1
-    )
     state_text = "站上150MA" if today_state == "above" else "跌破150MA"
 
     title = "✅ SPX 150MA 监控服务存活 (周六心跳)"
@@ -151,10 +184,10 @@ def run_heartbeat(today_close: float, today_ma: float, today_date_str: str, last
         f"**最近交易日**: {today_date_str}\n\n"
         f"**收盘**: {today_close:.2f}\n\n"
         f"**150MA**: {today_ma:.2f}\n\n"
-        f"**当前状态**: {state_text} (已持续 {consecutive_days} 个交易日)\n\n"
+        f"**当前状态**: {state_text} (已持续 {consecutive_days} 个交易日, 自 {run_start_date} 起)\n\n"
         f"---\n_GitHub Actions 周六心跳, 收到本消息说明服务没崩_"
     )
-    print(f"💓 周六心跳, 推送: {state_text}, 持续 {consecutive_days} 个交易日")
+    print(f"💓 周六心跳, 推送: {state_text}, 持续 {consecutive_days} 个交易日 (自 {run_start_date} 起)")
     push_serverchan(title, content)
 
     return {
@@ -163,6 +196,7 @@ def run_heartbeat(today_close: float, today_ma: float, today_date_str: str, last
         "close": today_close,
         "ma150": today_ma,
         "consecutive_days": consecutive_days,
+        "run_start_date": run_start_date,
     }
 
 
@@ -176,15 +210,18 @@ def main():
 
     print(f"🚀 SPX 150MA 监控 - 模式: {mode}")
 
-    # 拉数据
-    today_close, today_ma, today_date_str, _ = fetch_spx_close_and_ma()
+    # 拉数据 + 从 K 线算真实持续天数 (不依赖 cache)
+    today_close, today_ma, today_date_str, _, close, ma = fetch_spx_data()
+    consecutive_days, run_start_date = compute_run_stats(close, ma)
     last_state = load_state()
 
     # 执行
     if mode == "daily":
-        new_state = run_daily(today_close, today_ma, today_date_str, last_state)
+        new_state = run_daily(today_close, today_ma, today_date_str, last_state,
+                              consecutive_days, run_start_date)
     else:
-        new_state = run_heartbeat(today_close, today_ma, today_date_str, last_state)
+        new_state = run_heartbeat(today_close, today_ma, today_date_str, last_state,
+                                  consecutive_days, run_start_date)
 
     # 持久化
     save_state(new_state)
