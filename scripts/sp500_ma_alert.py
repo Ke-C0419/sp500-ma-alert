@@ -7,13 +7,16 @@ SPX (标普500) 150MA 突破监控告警
   - 工作日盘后 (UTC 22:00, 美股收盘后约1小时): 拉取 SPX 日线, 计算今日收盘 vs 150MA
     * 若与上次状态不同 -> 推送微信告警
     * 若状态不变 -> 不推送 (避免噪音)
-  - 周六心跳 (UTC 02:00): 固定推送一次, 确认服务存活 + 当前状态
+  - 周末心跳 (周六/周日 UTC 02:00, 各一次): 固定推送一次, 确认服务存活 + 当前状态
+    * 模式判定不依赖触发时刻的 wall-clock, 而是依据 workflow 透传的
+      github.event.schedule (见 INPUT_MODE / HEARTBEAT_CRON), 避免 schedule
+      触发延迟漂移导致心跳被误判成 daily 而漏推
 
 状态持久化: state/sp500_state.json (在 GitHub Actions 中用 actions/cache 持久化)
 连续天数: 从 K 线回溯计算, 不依赖状态文件, 即使 cache 丢失也能给出真实值
 
 用法:
-  python scripts/sp500_ma_alert.py            # 自动判断模式 (UTC 周六=心跳, 其它=日常)
+  python scripts/sp500_ma_alert.py            # 依据 INPUT_MODE 环境变量判断模式
   python scripts/sp500_ma_alert.py daily      # 强制日常模式
   python scripts/sp500_ma_alert.py heartbeat  # 强制心跳模式
 """
@@ -178,16 +181,16 @@ def run_heartbeat(today_close: float, today_ma: float, today_date_str: str,
     today_state = "above" if today_close > today_ma else "below"
     state_text = "站上150MA" if today_state == "above" else "跌破150MA"
 
-    title = "✅ SPX 150MA 监控服务存活 (周六心跳)"
+    title = "✅ SPX 150MA 监控服务存活 (心跳)"
     content = (
-        f"## 周六心跳 - 服务正常\n\n"
+        f"## 心跳 - 服务正常\n\n"
         f"**最近交易日**: {today_date_str}\n\n"
         f"**收盘**: {today_close:.2f}\n\n"
         f"**150MA**: {today_ma:.2f}\n\n"
         f"**当前状态**: {state_text} (已持续 {consecutive_days} 个交易日, 自 {run_start_date} 起)\n\n"
-        f"---\n_GitHub Actions 周六心跳, 收到本消息说明服务没崩_"
+        f"---\n_GitHub Actions 心跳, 收到本消息说明服务没崩_"
     )
-    print(f"💓 周六心跳, 推送: {state_text}, 持续 {consecutive_days} 个交易日 (自 {run_start_date} 起)")
+    print(f"💓 心跳, 推送: {state_text}, 持续 {consecutive_days} 个交易日 (自 {run_start_date} 起)")
     push_serverchan(title, content)
 
     return {
@@ -201,12 +204,25 @@ def run_heartbeat(today_close: float, today_ma: float, today_date_str: str,
 
 
 def main():
-    # 模式判断: 命令行参数 > 自动判断 (UTC 周六=心跳)
+    # 模式判断 (按可靠性从高到低):
+    #   1) 命令行参数 (手动触发 / 调试)
+    #   2) INPUT_MODE 环境变量: workflow 把 github.event.schedule 原样透传,
+    #      与 HEARTBEAT_CRON 中任一条精确匹配 => 心跳
+    #   3) 兜底: 无任何输入时按 UTC 周六判断
+    # 注意: 不能用 utcnow() 直接判断模式 —— GitHub schedule 触发会漂移,
+    #      触发时刻可能滑到周日凌晨, 导致周六心跳被误判成 daily 而不推送.
+    heartbeat_crons = [c.strip() for c in os.environ.get("HEARTBEAT_CRON", "0 2 * * 6").split(",") if c.strip()]
+    raw_input = os.environ.get("INPUT_MODE", "").strip()
+
     mode = sys.argv[1] if len(sys.argv) > 1 else None
     if mode not in ("daily", "heartbeat"):
-        today_utc = datetime.datetime.utcnow().date()
-        mode = "heartbeat" if today_utc.weekday() == 5 else "daily"
-        print(f"🕐 自动判断模式: UTC={today_utc} (weekday={today_utc.weekday()}), mode={mode}")
+        if raw_input:
+            mode = "heartbeat" if raw_input in heartbeat_crons else "daily"
+            print(f"🕐 依据触发 cron '{raw_input}' 判定模式: {mode}")
+        else:
+            today_utc = datetime.datetime.utcnow().date()
+            mode = "heartbeat" if today_utc.weekday() == 5 else "daily"
+            print(f"🕐 兜底判断模式: UTC={today_utc} (weekday={today_utc.weekday()}), mode={mode}")
 
     print(f"🚀 SPX 150MA 监控 - 模式: {mode}")
 

@@ -4,16 +4,21 @@ name: SPX 150MA Monitor
 #   - 工作日盘后: UTC 22:00 周一~周五 (美股收盘后约1-2小时, 等数据写入)
 #     · 夏令时: 北京次日 06:00
 #     · 冬令时: 北京次日 07:00
-#   - 周六心跳: UTC 02:00 周六 (北京周六 10:00)
+#   - 周末心跳: 周六、周日各一次 UTC 02:00 (北京 10:00)
+#     · 命中心跳 cron 就固定推一次, 确认服务存活 + 当前状态
+#     · 两条心跳 cron 都指向 heartbeat, 极端漂移下周末可能收两条, 但绝不漏
+#     · 不用 utcnow() 判断星期: schedule 触发会延迟漂移, 漂到周日凌晨
+#       会把周六心跳误判成 daily 而漏推 (历史 bug) —— 改为按触发 cron 判定
 #   - 支持手动触发 (可指定 mode: daily / heartbeat)
 on:
   schedule:
     - cron: '0 22 * * 1-5'   # 工作日盘后
     - cron: '0 2 * * 6'      # 周六心跳
+    - cron: '0 2 * * 0'      # 周日心跳
   workflow_dispatch:
     inputs:
       mode:
-        description: '运行模式 (daily=日常告警 / heartbeat=周六心跳)'
+        description: '运行模式 (daily=日常告警 / heartbeat=心跳)'
         required: false
         default: 'daily'
         type: choice
@@ -64,12 +69,17 @@ jobs:
       - name: Run monitor
         env:
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          # schedule 事件时, 原样透传命中的 cron 字符串 (不受触发延迟影响);
+          # dispatch 事件时该字段为空, 脚本回退到 utcnow() 兜底判断.
+          INPUT_MODE: ${{ github.event.schedule }}
+          # 心跳对应的 cron (逗号分隔, 命中任一条即心跳)
+          HEARTBEAT_CRON: '0 2 * * 6,0 2 * * 0'
           TZ: UTC
         run: |
-          # 优先用 dispatch 传入的 mode, 否则让脚本自动判断
+          # 优先用 dispatch 传入的 mode, 否则让脚本按 cron 自动判断
           MODE="${{ github.event.inputs.mode }}"
           if [ -z "$MODE" ]; then
-            echo "非手动触发, 脚本自动判断模式"
+            echo "非手动触发, 脚本按触发 cron 自动判断模式 (INPUT_MODE=$INPUT_MODE)"
             python scripts/sp500_ma_alert.py
           else
             echo "手动触发, mode=$MODE"
